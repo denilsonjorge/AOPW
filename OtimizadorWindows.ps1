@@ -14,13 +14,29 @@
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$Script:Versao      = '2.0'
+$Script:Versao      = '1.0'
 $Script:Pasta       = Join-Path $env:ProgramData 'OtimizadorWindows'
 $Script:LogFile     = Join-Path $Script:Pasta 'otimizador.log'
 $Script:BackupFile  = Join-Path $Script:Pasta 'backup.jsonl'
 $Script:Reiniciar   = $false
 $Script:Largura     = 72
 $Script:Simulacao   = $false
+if ($env:WT_SESSION) { $Script:B = @{ TL = '╔'; TR = '╗'; BL = '╚'; BR = '╝'; H = '═'; V = '║'; L = '─' } }
+else                 { $Script:B = @{ TL = '+'; TR = '+'; BL = '+'; BR = '+'; H = '='; V = '|'; L = '-' } }
+
+# ───────────────────── Autorreparação da codificação do ficheiro ─────────────────────
+# Sem BOM UTF-8, o PowerShell 5.1 lê o script como ANSI e os acentos aparecem trocados.
+if ('ç'.Length -ne 1 -and $PSCommandPath -and -not $env:OTIMIZADOR_REPARO) {
+    try {
+        $txt = [System.IO.File]::ReadAllText($PSCommandPath, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($PSCommandPath, $txt, (New-Object System.Text.UTF8Encoding $true))
+        $env:OTIMIZADOR_REPARO = '1'
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        exit
+    } catch {
+        Write-Host 'Codificacao do ficheiro incorreta. Abra o script e guarde-o como "UTF-8 com BOM".' -ForegroundColor Yellow
+    }
+}
 
 # ───────────────────────── Verificação de privilégios ─────────────────────────
 function Test-Admin {
@@ -58,10 +74,10 @@ $Host.UI.RawUI.WindowTitle = "Otimizador de Performance v$Script:Versao (Adminis
 function Write-Log($Nivel, $Msg) {
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Nivel] $Msg" | Add-Content -Path $Script:LogFile -Encoding UTF8
 }
-function Write-OK($m)   { Write-Host "  [✔] $m" -ForegroundColor Green;  Write-Log 'OK'   $m }
+function Write-OK($m)   { Write-Host "  [OK] $m" -ForegroundColor Green;  Write-Log 'OK'   $m }
 function Write-Info($m) { Write-Host "  [i] $m" -ForegroundColor Cyan;   Write-Log 'INFO' $m }
 function Write-Warn($m) { Write-Host "  [!] $m" -ForegroundColor Yellow; Write-Log 'AVISO' $m }
-function Write-Err($m)  { Write-Host "  [✘] $m" -ForegroundColor Red;    Write-Log 'ERRO' $m }
+function Write-Err($m)  { Write-Host "  [ERRO] $m" -ForegroundColor Red;    Write-Log 'ERRO' $m }
 
 function Center([string]$t, [int]$w) {
     $p = [math]::Max(0, $w - $t.Length); $e = [int][math]::Floor($p / 2)
@@ -70,15 +86,15 @@ function Center([string]$t, [int]$w) {
 
 function Show-Header([string]$Subtitulo = '') {
     Clear-Host
-    $l = '═' * $Script:Largura
-    Write-Host "╔${l}╗" -ForegroundColor Cyan
-    Write-Host ("║{0}║" -f (Center 'OTIMIZADOR DE PERFORMANCE  •  WINDOWS 10 / 11' $Script:Largura)) -ForegroundColor White
-    Write-Host ("║{0}║" -f (Center "Versão $Script:Versao  |  Modo Administrador" $Script:Largura)) -ForegroundColor DarkCyan
-    Write-Host "╚${l}╝" -ForegroundColor Cyan
+    $l = $Script:B.H * $Script:Largura
+    Write-Host ($Script:B.TL + $l + $Script:B.TR) -ForegroundColor Cyan
+    Write-Host ("$($Script:B.V){0}$($Script:B.V)" -f (Center 'OTIMIZADOR DE PERFORMANCE  |  WINDOWS 10 / 11' $Script:Largura)) -ForegroundColor White
+    Write-Host ("$($Script:B.V){0}$($Script:B.V)" -f (Center "Versão $Script:Versao  |  Modo Administrador" $Script:Largura)) -ForegroundColor DarkCyan
+    Write-Host ($Script:B.BL + $l + $Script:B.BR) -ForegroundColor Cyan
     if ($Script:Simulacao) { Write-Host (Center '*** MODO SIMULAÇÃO ATIVO - NADA SERÁ ALTERADO ***' $Script:Largura) -ForegroundColor Magenta }
     if ($Subtitulo) {
-        Write-Host "`n  ▌ $Subtitulo" -ForegroundColor Yellow
-        Write-Host ("  " + ('─' * ($Script:Largura - 2))) -ForegroundColor DarkGray
+        Write-Host "`n  >> $Subtitulo" -ForegroundColor Yellow
+        Write-Host ("  " + ($Script:B.L * ($Script:Largura - 2))) -ForegroundColor DarkGray
     }
 }
 
@@ -690,9 +706,9 @@ function Show-Principal {
     $os = Get-CimInstance Win32_OperatingSystem
     $t = $os.TotalVisibleMemorySize / 1MB; $l = $os.FreePhysicalMemory / 1MB
     Write-Host ("  PC: {0}  |  {1}" -f $env:COMPUTERNAME, $os.Caption) -ForegroundColor Gray
-    Write-Host ("  RAM: {0:N1}/{1:N1} GB livres  |  Privilégios: Administrador ✔" -f $l, $t) -ForegroundColor Gray
+    Write-Host ("  RAM: {0:N1}/{1:N1} GB livres  |  Privilégios: Administrador" -f $l, $t) -ForegroundColor Gray
     Write-Host ("  Tipo: {0}  |  Disco do sistema: {1}" -f $(if ($Script:EhPortatil) { 'Portátil' } else { 'Desktop' }), $Script:MidiaSistema) -ForegroundColor Gray
-    Write-Host ("  " + ('─' * ($Script:Largura - 2))) -ForegroundColor DarkGray
+    Write-Host ("  " + ($Script:B.L * ($Script:Largura - 2))) -ForegroundColor DarkGray
     $m = @('Otimização de Inicialização e Desligamento', 'Otimização de Acesso (disco e arquivos)', 'Controle Energético',
            'Otimização de Memória e Processamento', 'Aceleração de Drives e Periféricos', 'Otimização de Rede e Internet',
            'Otimização para Jogos', 'Serviços Desnecessários e Telemetria', 'Otimização Gráfica',
