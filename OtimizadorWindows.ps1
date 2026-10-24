@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Otimizador de Performance para Windows 10/11 - menu interativo.
 .DESCRIPTION
@@ -14,12 +14,13 @@
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$Script:Versao      = '1.0'
+$Script:Versao      = '2.0'
 $Script:Pasta       = Join-Path $env:ProgramData 'OtimizadorWindows'
 $Script:LogFile     = Join-Path $Script:Pasta 'otimizador.log'
 $Script:BackupFile  = Join-Path $Script:Pasta 'backup.jsonl'
 $Script:Reiniciar   = $false
 $Script:Largura     = 72
+$Script:Simulacao   = $false
 
 # ───────────────────────── Verificação de privilégios ─────────────────────────
 function Test-Admin {
@@ -44,6 +45,12 @@ if ($Script:Build -lt 10240) {
     Write-Host "  [X] Requer Windows 10 ou superior." -ForegroundColor Red; Start-Sleep 4; exit
 }
 $Script:EhWin11 = $Script:Build -ge 22000
+$ch = @((Get-CimInstance Win32_SystemEnclosure -ErrorAction SilentlyContinue).ChassisTypes)
+$Script:EhPortatil = [bool]($ch | Where-Object { $_ -in 8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32 }) -or
+                     [bool](Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue)
+try   { $Script:MidiaSistema = [string](Get-Partition -DriveLetter $env:SystemDrive.TrimEnd(':') | Get-Disk | Get-PhysicalDisk).MediaType }
+catch { $Script:MidiaSistema = 'Desconhecido' }
+if (-not $Script:MidiaSistema) { $Script:MidiaSistema = 'Desconhecido' }
 if (-not (Test-Path $Script:Pasta)) { New-Item -ItemType Directory -Path $Script:Pasta -Force | Out-Null }
 $Host.UI.RawUI.WindowTitle = "Otimizador de Performance v$Script:Versao (Administrador)"
 
@@ -68,6 +75,7 @@ function Show-Header([string]$Subtitulo = '') {
     Write-Host ("║{0}║" -f (Center 'OTIMIZADOR DE PERFORMANCE  •  WINDOWS 10 / 11' $Script:Largura)) -ForegroundColor White
     Write-Host ("║{0}║" -f (Center "Versão $Script:Versao  |  Modo Administrador" $Script:Largura)) -ForegroundColor DarkCyan
     Write-Host "╚${l}╝" -ForegroundColor Cyan
+    if ($Script:Simulacao) { Write-Host (Center '*** MODO SIMULAÇÃO ATIVO - NADA SERÁ ALTERADO ***' $Script:Largura) -ForegroundColor Magenta }
     if ($Subtitulo) {
         Write-Host "`n  ▌ $Subtitulo" -ForegroundColor Yellow
         Write-Host ("  " + ('─' * ($Script:Largura - 2))) -ForegroundColor DarkGray
@@ -89,14 +97,29 @@ function Invoke-Menu([string]$Titulo, [array]$Itens) {
     while ($true) {
         Show-Header $Titulo
         for ($i = 0; $i -lt $Itens.Count; $i++) {
-            Write-Host ("   [{0,2}] {1}" -f ($i + 1), $Itens[$i].N)
+            $r   = if ($Itens[$i].R) { $Itens[$i].R } else { 'S' }
+            $cor = @{ S = 'Green'; M = 'Yellow'; A = 'Red' }[$r]
+            $txt = @{ S = 'Seguro  '; M = 'Moderado'; A = 'Avançado' }[$r]
+            Write-Host ("   [{0,2}] " -f ($i + 1)) -NoNewline
+            Write-Host "[$txt] " -ForegroundColor $cor -NoNewline
+            Write-Host $Itens[$i].N
         }
+        Write-Host "`n   Legenda: " -NoNewline -ForegroundColor DarkGray
+        Write-Host 'Seguro  ' -NoNewline -ForegroundColor Green
+        Write-Host 'Moderado  ' -NoNewline -ForegroundColor Yellow
+        Write-Host 'Avançado' -ForegroundColor Red
         Write-Host "   [ 0] Voltar ao menu principal" -ForegroundColor DarkGray
         $e = Read-Host "`n  Escolha"
         if ($e -eq '0') { return }
         if ($e -match '^\d+$' -and [int]$e -ge 1 -and [int]$e -le $Itens.Count) {
             Write-Host ""
-            try { & $Itens[[int]$e - 1].A } catch { Write-Err $_.Exception.Message }
+            $item = $Itens[[int]$e - 1]
+            if ($Script:Simulacao -and -not $item.L) {
+                Write-Host "  [SIMULAÇÃO] Nada foi alterado. Comandos que seriam executados:`n" -ForegroundColor Magenta
+                Write-Host $item.A.ToString().Trim() -ForegroundColor DarkGray
+            } else {
+                try { & $item.A } catch { Write-Err $_.Exception.Message }
+            }
             Pausar
         }
     }
@@ -109,6 +132,7 @@ function Save-Backup([hashtable]$Obj) {
 
 function Set-Reg {
     param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
+    if ($Script:Simulacao) { Write-Host "  [SIMULAÇÃO] $Path\$Name = $Value" -ForegroundColor Magenta; return }
     $existed = $false; $old = $null; $kind = $Type
     if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
     else {
@@ -117,6 +141,7 @@ function Set-Reg {
             $existed = $true
             $old  = $k.GetValue($Name, $null, 'DoNotExpandEnvironmentNames')
             $kind = [string]$k.GetValueKind($Name)
+            if ($kind -eq 'Binary' -and $old) { $old = [Convert]::ToBase64String($old) }
         }
     }
     Save-Backup @{ Tipo = 'reg'; Path = $Path; Name = $Name; Existed = $existed; Old = $old; Kind = $kind }
@@ -127,7 +152,9 @@ function Set-Svc([string]$Name, [string]$Modo) {   # Modo: Disabled | Manual | A
     $s = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
     if (-not $s) { return $false }
     if ($s.StartMode -notin 'Auto', 'Manual', 'Disabled') { return $false }
-    Save-Backup @{ Tipo = 'svc'; Name = $Name; Old = $s.StartMode }
+    if ($Script:Simulacao) { Write-Host "  [SIMULAÇÃO] Serviço ${Name}: $($s.StartMode) -> $Modo" -ForegroundColor Magenta; return $true }
+    $d = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name DelayedAutostart -ErrorAction SilentlyContinue).DelayedAutostart
+    Save-Backup @{ Tipo = 'svc'; Name = $Name; Old = $s.StartMode; Delayed = ($d -eq 1) }
     if ($Modo -eq 'Disabled') { Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue }
     $m = @{ Disabled = 'disabled'; Manual = 'demand'; Auto = 'auto' }[$Modo]
     & sc.exe config $Name start= $m | Out-Null
@@ -137,12 +164,17 @@ function Set-Svc([string]$Name, [string]$Modo) {   # Modo: Disabled | Manual | A
 function Disable-Tarefa([string]$Path, [string]$Name) {
     $t = Get-ScheduledTask -TaskPath $Path -TaskName $Name -ErrorAction SilentlyContinue
     if (-not $t -or $t.State -eq 'Disabled') { return }
+    if ($Script:Simulacao) { Write-Host "  [SIMULAÇÃO] Tarefa desativada: $Path$Name" -ForegroundColor Magenta; return }
     Save-Backup @{ Tipo = 'task'; Path = $Path; Name = $Name }
     Disable-ScheduledTask -TaskPath $Path -TaskName $Name | Out-Null
 }
 
 function Restore-All {
     if (-not (Test-Path $Script:BackupFile)) { Write-Info "Nenhuma alteração registada para reverter."; return }
+    if ($Script:Simulacao) {
+        Write-Info 'Simulação: seriam revertidos os itens abaixo (valor original gravado).'
+        Get-Content $Script:BackupFile -Encoding UTF8 | Write-Host -ForegroundColor DarkGray; return
+    }
     if (-not (Confirm-Acao "Reverter TODAS as alterações feitas por este programa?")) { return }
     $seen = @{}
     $itens = Get-Content $Script:BackupFile -Encoding UTF8 | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }
@@ -152,10 +184,14 @@ function Restore-All {
         try {
             switch ($i.Tipo) {
                 'reg' {
-                    if ($i.Existed) { Set-ItemProperty -LiteralPath $i.Path -Name $i.Name -Value $i.Old -Type $i.Kind -Force }
+                    if ($i.Existed) {
+                        $v = $i.Old
+                        if ($i.Kind -eq 'Binary') { $v = [Convert]::FromBase64String($v) }
+                        Set-ItemProperty -LiteralPath $i.Path -Name $i.Name -Value $v -Type $i.Kind -Force
+                    }
                     else { Remove-ItemProperty -LiteralPath $i.Path -Name $i.Name -ErrorAction SilentlyContinue }
                 }
-                'svc'  { $m = @{ Disabled = 'disabled'; Manual = 'demand'; Auto = 'auto' }[$i.Old]; & sc.exe config $i.Name start= $m | Out-Null }
+                'svc'  { $m = @{ Disabled = 'disabled'; Manual = 'demand'; Auto = 'auto' }[$i.Old]; if ($i.Old -eq 'Auto' -and $i.Delayed) { $m = 'delayed-auto' }; & sc.exe config $i.Name start= $m | Out-Null }
                 'task' { Enable-ScheduledTask -TaskPath $i.Path -TaskName $i.Name | Out-Null }
             }
             Write-OK "Revertido: $($i.Tipo) $($i.Name)"
@@ -166,11 +202,19 @@ function Restore-All {
 }
 
 function New-Restore {
+    $k = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+    $nome = 'SystemRestorePointCreationFrequency'
+    $antigo = (Get-ItemProperty -Path $k -Name $nome -ErrorAction SilentlyContinue).$nome
     try {
         Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $k -Name $nome -Value 0 -Type DWord -Force    # remove o limite de 1 ponto / 24 h
         Checkpoint-Computer -Description "Otimizador Windows $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
         Write-OK "Ponto de restauração criado."
     } catch { Write-Warn "Ponto de restauração não criado: $($_.Exception.Message)" }
+    finally {
+        if ($null -ne $antigo) { Set-ItemProperty -Path $k -Name $nome -Value $antigo -Type DWord -Force -ErrorAction SilentlyContinue }
+        else { Remove-ItemProperty -Path $k -Name $nome -ErrorAction SilentlyContinue }
+    }
 }
 
 # ───────────────────────────── Funções reutilizáveis ─────────────────────────────
@@ -179,15 +223,28 @@ function Set-Plano([string]$Guid) {
     if ($LASTEXITCODE -ne 0) { throw "Plano de energia indisponível neste dispositivo." }
 }
 
-function Set-PlanoMaximo {
-    $lista = & powercfg.exe /list | Out-String
-    $linha = ($lista -split "`n") | Where-Object { $_ -match 'Ultimate|Desempenho M' } | Select-Object -First 1
-    if (-not $linha) {
-        $lista = & powercfg.exe -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>&1 | Out-String
-        $linha = $lista
+function Confirm-Portatil([string]$Acao) {
+    if ($Script:EhPortatil) {
+        Write-Warn "Portátil detetado: $Acao reduz a autonomia da bateria."
+        if (-not (Confirm-Acao 'Continuar mesmo assim?')) { throw 'Cancelado pelo utilizador.' }
     }
-    if ($linha -match '([0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})') { Set-Plano $Matches[1] }
-    else { Set-Plano 'SCHEME_MIN' }
+}
+
+function Set-PlanoMaximo {
+    Confirm-Portatil 'o plano Desempenho Máximo'
+    $reGuid = '[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
+    $arq = Join-Path $Script:Pasta 'plano-maximo.guid'      # independente do idioma do Windows
+    $guid = $null
+    $existentes = & powercfg.exe /list | Out-String
+    if (Test-Path $arq) {
+        $g = (Get-Content $arq -Raw).Trim()
+        if ($g -and $existentes -match [regex]::Escape($g)) { $guid = $g }
+    }
+    if (-not $guid) {
+        $saida = & powercfg.exe -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>&1 | Out-String
+        if ($saida -match "($reGuid)") { $guid = $Matches[1]; Set-Content -Path $arq -Value $guid }
+    }
+    if ($guid) { Set-Plano $guid } else { Set-Plano 'SCHEME_MIN' }
 }
 
 function Disable-UsbSuspend {
@@ -237,7 +294,7 @@ function Clear-Temp {
 # ═══════════════════════════ 1. INICIALIZAÇÃO E DESLIGAMENTO ═══════════════════════════
 function Menu-Inicializacao {
     Invoke-Menu '1. Otimização de Inicialização e Desligamento' @(
-        @{ N = 'Reduzir tempo de encerramento de serviços e aplicações'; A = {
+        @{ R = 'M'; N = 'Reduzir tempo de encerramento de serviços e aplicações'; A = {
             Invoke-Step 'Timeout de serviços = 5 s' { Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control' 'WaitToKillServiceTimeout' '5000' 'String' }
             Invoke-Step 'Timeout de aplicações = 5 s' { Set-Reg 'HKCU:\Control Panel\Desktop' 'WaitToKillAppTimeout' '5000' 'String' }
             Invoke-Step 'Timeout de apps travadas = 4 s' { Set-Reg 'HKCU:\Control Panel\Desktop' 'HungAppTimeout' '4000' 'String' } } },
@@ -247,10 +304,10 @@ function Menu-Inicializacao {
             Invoke-Step 'Fast Startup ativado' { Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' 'HiberbootEnabled' 1 } } },
         @{ N = 'Desativar Inicialização Rápida (resolve problemas de drivers/dual boot)'; A = {
             Invoke-Step 'Fast Startup desativado' { Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' 'HiberbootEnabled' 0 } } },
-        @{ N = 'Listar programas que iniciam com o Windows'; A = {
+        @{ L = $true; N = 'Listar programas que iniciam com o Windows'; A = {
             Get-CimInstance Win32_StartupCommand | Select-Object Name, Location, Command | Format-Table -AutoSize -Wrap | Out-String -Width 120 | Write-Host } },
-        @{ N = 'Abrir Gestor de Tarefas > Aplicações de inicialização'; A = { Start-Process taskmgr.exe -ArgumentList '/0 /startup' } },
-        @{ N = 'Mostrar tempo do último arranque'; A = {
+        @{ L = $true; N = 'Abrir Gestor de Tarefas > Aplicações de inicialização'; A = { Start-Process taskmgr.exe -ArgumentList '/0 /startup' } },
+        @{ L = $true; N = 'Mostrar tempo do último arranque'; A = {
             $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Diagnostics-Performance/Operational'; Id = 100 } -MaxEvents 1 -ErrorAction Stop
             $x = [xml]$ev.ToXml()
             $ms = ($x.Event.EventData.Data | Where-Object Name -eq 'BootTime').'#text'
@@ -261,11 +318,11 @@ function Menu-Inicializacao {
 # ═══════════════════════════════ 2. ACESSO (DISCO/ARQUIVOS) ═══════════════════════════════
 function Menu-Acesso {
     Invoke-Menu '2. Otimização de Acesso (disco e arquivos)' @(
-        @{ N = 'Desativar atualização do "último acesso" NTFS (menos escritas)'; A = {
+        @{ R = 'M'; N = 'Desativar atualização do "último acesso" NTFS (menos escritas)'; A = {
             Invoke-Step 'disablelastaccess = 1' { & fsutil.exe behavior set disablelastaccess 1 | Out-Null } } },
         @{ N = 'Restaurar "último acesso" ao padrão do Windows'; A = {
             Invoke-Step 'disablelastaccess = padrão (2)' { & fsutil.exe behavior set disablelastaccess 2 | Out-Null } } },
-        @{ N = 'Verificar estado do TRIM'; A = { & fsutil.exe behavior query DisableDeleteNotify | Write-Host
+        @{ L = $true; N = 'Verificar estado do TRIM'; A = { & fsutil.exe behavior query DisableDeleteNotify | Write-Host
             Write-Info "0 = TRIM ativo | 1 = TRIM desativado" } },
         @{ N = 'Ativar TRIM (SSD)'; A = { Invoke-Step 'TRIM ativado' { & fsutil.exe behavior set DisableDeleteNotify 0 | Out-Null } } },
         @{ N = 'Ativar suporte a caminhos longos (> 260 caracteres)'; A = {
@@ -283,16 +340,16 @@ function Menu-Acesso {
 # ═══════════════════════════════════ 3. CONTROLE ENERGÉTICO ═══════════════════════════════════
 function Menu-Energia {
     Invoke-Menu '3. Controle Energético' @(
-        @{ N = 'Plano: Desempenho Máximo (Ultimate Performance)'; A = { Invoke-Step 'Plano Desempenho Máximo ativo' { Set-PlanoMaximo } } },
-        @{ N = 'Plano: Alto Desempenho'; A = { Invoke-Step 'Plano Alto Desempenho ativo' { Set-Plano 'SCHEME_MIN' } } },
+        @{ R = 'M'; N = 'Plano: Desempenho Máximo (Ultimate Performance)'; A = { Invoke-Step 'Plano Desempenho Máximo ativo' { Set-PlanoMaximo } } },
+        @{ R = 'M'; N = 'Plano: Alto Desempenho'; A = { Invoke-Step 'Plano Alto Desempenho ativo' { Confirm-Portatil 'o plano Alto Desempenho'; Set-Plano 'SCHEME_MIN' } } },
         @{ N = 'Plano: Equilibrado (recomendado em portáteis)'; A = { Invoke-Step 'Plano Equilibrado ativo' { Set-Plano 'SCHEME_BALANCED' } } },
         @{ N = 'Plano: Economia de energia'; A = { Invoke-Step 'Plano Economia ativo' { Set-Plano 'SCHEME_MAX' } } },
         @{ N = 'Desativar suspensão seletiva USB'; A = { Invoke-Step 'Suspensão seletiva USB desativada' { Disable-UsbSuspend } } },
-        @{ N = 'Desativar hibernação (libera espaço; desativa o Fast Startup)'; A = {
+        @{ R = 'M'; N = 'Desativar hibernação (libera espaço; desativa o Fast Startup)'; A = {
             if (Confirm-Acao 'Confirmar?') { Invoke-Step 'Hibernação desativada' { & powercfg.exe /hibernate off } } } },
         @{ N = 'Ativar hibernação'; A = { Invoke-Step 'Hibernação ativada' { & powercfg.exe /hibernate on } } },
-        @{ N = 'Mostrar plano ativo'; A = { & powercfg.exe /getactivescheme | Write-Host } },
-        @{ N = 'Gerar relatório de bateria (Ambiente de trabalho)'; A = {
+        @{ L = $true; N = 'Mostrar plano ativo'; A = { & powercfg.exe /getactivescheme | Write-Host } },
+        @{ L = $true; N = 'Gerar relatório de bateria (Ambiente de trabalho)'; A = {
             $f = Join-Path ([Environment]::GetFolderPath('Desktop')) 'relatorio-bateria.html'
             & powercfg.exe /batteryreport /output $f | Out-Null; Write-OK "Relatório: $f" } }
     )
@@ -301,15 +358,15 @@ function Menu-Energia {
 # ═════════════════════════════ 4. MEMÓRIA E PROCESSAMENTO ═════════════════════════════
 function Menu-Memoria {
     Invoke-Menu '4. Otimização de Memória e Processamento' @(
-        @{ N = 'Mostrar uso atual de memória'; A = {
+        @{ L = $true; N = 'Mostrar uso atual de memória'; A = {
             $os = Get-CimInstance Win32_OperatingSystem
             $t = $os.TotalVisibleMemorySize / 1MB; $l = $os.FreePhysicalMemory / 1MB
             Write-Info ("Total: {0:N1} GB | Livre: {1:N1} GB | Em uso: {2:N0}%" -f $t, $l, (($t - $l) / $t * 100)) } },
-        @{ N = 'Top 15 processos por memória'; A = {
+        @{ L = $true; N = 'Top 15 processos por memória'; A = {
             Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 15 Name, Id,
                 @{ N = 'RAM (MB)'; E = { [math]::Round($_.WorkingSet64 / 1MB) } },
                 @{ N = 'CPU (s)';  E = { [math]::Round($_.CPU, 1) } } | Format-Table -AutoSize | Out-String | Write-Host } },
-        @{ N = 'Desativar aplicações em segundo plano (UWP)'; A = {
+        @{ R = 'M'; N = 'Desativar aplicações em segundo plano (UWP)'; A = {
             Invoke-Step 'Apps em segundo plano desativadas' {
                 Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' 'GlobalUserDisabled' 1
                 Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BackgroundAppGlobalToggle' 0 } } },
@@ -319,17 +376,19 @@ function Menu-Memoria {
             Invoke-Step 'Compressão de memória ativada' { Enable-MMAgent -MemoryCompression }
             Get-MMAgent | Format-List MemoryCompression, PageCombining | Out-String | Write-Host
             $Script:Reiniciar = $true } },
-        @{ N = 'SysMain (Superfetch): desativar - SOMENTE se o sistema está em SSD'; A = {
-            Write-Warn "Em SSD o ganho é pequeno; em HDD pode PIORAR o desempenho."
+        @{ R = 'A'; N = 'SysMain (Superfetch): desativar - SOMENTE se o sistema está em SSD'; A = {
+            if ($Script:MidiaSistema -eq 'HDD') { Write-Err 'Bloqueado: o sistema está num HDD e desativar o SysMain PIORA o desempenho.'; return }
+            if ($Script:MidiaSistema -ne 'SSD') { Write-Warn "Tipo de disco do sistema não identificado ($Script:MidiaSistema)." }
+            Write-Warn 'Em SSD o ganho é pequeno.'
             if (Confirm-Acao 'Desativar SysMain?') { Invoke-Step 'SysMain desativado' { [void](Set-Svc 'SysMain' 'Disabled') } } } },
-        @{ N = 'Agendar Diagnóstico de Memória do Windows'; A = { Start-Process mdsched.exe } }
+        @{ L = $true; N = 'Agendar Diagnóstico de Memória do Windows'; A = { Start-Process mdsched.exe } }
     )
 }
 
 # ═══════════════════════════ 5. ACELERAÇÃO DE DRIVES E PERIFÉRICOS ═══════════════════════════
 function Menu-Drives {
     Invoke-Menu '5. Aceleração de Drives e Periféricos' @(
-        @{ N = 'Identificar discos (SSD/HDD) e estado de saúde'; A = {
+        @{ L = $true; N = 'Identificar discos (SSD/HDD) e estado de saúde'; A = {
             Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus,
                 @{ N = 'GB'; E = { [math]::Round($_.Size / 1GB) } } | Format-Table -AutoSize | Out-String | Write-Host
             try { Get-PhysicalDisk | Get-StorageReliabilityCounter | Select-Object DeviceId, Temperature, Wear, ReadErrorsTotal, WriteErrorsTotal |
@@ -342,7 +401,7 @@ function Menu-Drives {
                 elseif ($tipo -eq 'HDD') { Optimize-Volume -DriveLetter $v.DriveLetter -Defrag -Verbose }
                 else { Write-Warn "Tipo de mídia desconhecido - ignorado." }
             } } },
-        @{ N = 'Listar dispositivos com problemas / drivers com erro'; A = {
+        @{ L = $true; N = 'Listar dispositivos com problemas / drivers com erro'; A = {
             $d = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object Status -eq 'Error'
             if ($d) { $d | Select-Object FriendlyName, Class, Status | Format-Table -AutoSize | Out-String | Write-Host }
             else { Write-OK 'Nenhum dispositivo com erro.' } } },
@@ -368,25 +427,25 @@ function Set-Dns([string[]]$Servidores) {
 
 function Menu-Rede {
     Invoke-Menu '6. Otimização de Rede e Internet' @(
-        @{ N = 'Diagnóstico: adaptadores ativos e latência (Cloudflare/Google)'; A = {
+        @{ L = $true; N = 'Diagnóstico: adaptadores ativos e latência (Cloudflare/Google)'; A = {
             Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object Name, LinkSpeed, InterfaceDescription | Format-Table -AutoSize | Out-String | Write-Host
             & ping.exe -n 4 1.1.1.1 | Write-Host; & ping.exe -n 4 8.8.8.8 | Write-Host } },
         @{ N = 'Limpar cache DNS'; A = { Invoke-Step 'Cache DNS limpo' { & ipconfig.exe /flushdns | Out-Null } } },
-        @{ N = 'Ajustar TCP (auto-tuning normal + RSS ativo)'; A = {
+        @{ R = 'M'; N = 'Ajustar TCP (auto-tuning normal + RSS ativo)'; A = {
             Invoke-Step 'TCP ajustado' {
                 & netsh.exe int tcp set global autotuninglevel=normal | Out-Null
                 & netsh.exe int tcp set global rss=enabled | Out-Null }
             & netsh.exe int tcp show global | Write-Host } },
-        @{ N = 'DNS: Cloudflare (1.1.1.1 / 1.0.0.1)'; A = { Invoke-Step 'DNS Cloudflare aplicado' { Set-Dns @('1.1.1.1', '1.0.0.1') } } },
-        @{ N = 'DNS: Google (8.8.8.8 / 8.8.4.4)'; A = { Invoke-Step 'DNS Google aplicado' { Set-Dns @('8.8.8.8', '8.8.4.4') } } },
+        @{ R = 'M'; N = 'DNS: Cloudflare (1.1.1.1 / 1.0.0.1)'; A = { Invoke-Step 'DNS Cloudflare aplicado' { Set-Dns @('1.1.1.1', '1.0.0.1') } } },
+        @{ R = 'M'; N = 'DNS: Google (8.8.8.8 / 8.8.4.4)'; A = { Invoke-Step 'DNS Google aplicado' { Set-Dns @('8.8.8.8', '8.8.4.4') } } },
         @{ N = 'DNS: voltar ao automático (DHCP)'; A = { Invoke-Step 'DNS automático' { Set-Dns @() } } },
-        @{ N = 'Desativar economia de energia nos adaptadores de rede'; A = {
+        @{ R = 'M'; N = 'Desativar economia de energia nos adaptadores de rede'; A = {
             Get-NetAdapter -Physical | ForEach-Object {
                 try { Set-NetAdapterPowerManagement -Name $_.Name -AllowComputerToTurnOffDevice Disabled -ErrorAction Stop; Write-OK $_.Name }
                 catch { Write-Warn "$($_.Name): não suportado" } } } },
         @{ N = 'Desativar envio de atualizações a outros PCs (Otimização de Entrega)'; A = {
             Invoke-Step 'Delivery Optimization: apenas HTTP' { Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' 'DODownloadMode' 0 } } },
-        @{ N = 'Reset completo de rede (Winsock + TCP/IP) - requer reinício'; A = {
+        @{ R = 'A'; N = 'Reset completo de rede (Winsock + TCP/IP) - requer reinício'; A = {
             Write-Warn 'Remove configurações de IP estático/VPN personalizadas de baixo nível.'
             if (Confirm-Acao 'Continuar?') {
                 Invoke-Step 'Winsock reiniciado' { & netsh.exe winsock reset | Out-Null }
@@ -398,7 +457,7 @@ function Menu-Rede {
 # ═══════════════════════════════════════ 7. JOGOS ═══════════════════════════════════════
 function Menu-Jogos {
     Invoke-Menu '7. Otimização para Jogos' @(
-        @{ N = 'APLICAR PERFIL GAMER (Modo de Jogo + sem Game DVR + MMCSS + energia + mouse)'; A = {
+        @{ R = 'M'; N = 'APLICAR PERFIL GAMER (Modo de Jogo + sem Game DVR + MMCSS + energia + mouse)'; A = {
             if (-not (Confirm-Acao 'Aplicar perfil completo?')) { return }
             Invoke-Step 'Modo de Jogo ativado' {
                 Set-Reg 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled' 1
@@ -422,12 +481,12 @@ function Menu-Jogos {
             Set-Reg 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled' 0
             Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0
             Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR' 'AllowGameDVR' 0 } } },
-        @{ N = 'Agendamento de GPU acelerado por hardware (HAGS): ATIVAR'; A = {
+        @{ R = 'M'; N = 'Agendamento de GPU acelerado por hardware (HAGS): ATIVAR'; A = {
             Write-Warn 'Requer GPU/driver compatível (WDDM 2.7+). Reinício necessário.'
             Invoke-Step 'HAGS ativado' { Set-Hags 2 } } },
-        @{ N = 'Agendamento de GPU acelerado por hardware (HAGS): DESATIVAR'; A = { Invoke-Step 'HAGS desativado' { Set-Hags 1 } } },
+        @{ R = 'M'; N = 'Agendamento de GPU acelerado por hardware (HAGS): DESATIVAR'; A = { Invoke-Step 'HAGS desativado' { Set-Hags 1 } } },
         @{ N = 'Limpar cache de shaders DirectX'; A = { Invoke-Step 'Cache de shaders limpo' { Clear-ShaderCache } } },
-        @{ N = 'Dicas finais'; A = {
+        @{ L = $true; N = 'Dicas finais'; A = {
             Write-Info 'Mantenha os drivers da GPU atualizados (site do fabricante).'
             Write-Info 'Feche navegadores/launchers pesados antes de jogar.'
             Write-Info 'Use o jogo instalado em SSD e mantenha >15% de espaço livre.' } }
@@ -471,9 +530,9 @@ function Disable-Privacidade {
 
 function Menu-Servicos {
     Invoke-Menu '8. Serviços Desnecessários e Telemetria' @(
-        @{ N = 'Desativar telemetria (política + serviços + tarefas agendadas)'; A = { Disable-Telemetria } },
+        @{ R = 'M'; N = 'Desativar telemetria (política + serviços + tarefas agendadas)'; A = { Disable-Telemetria } },
         @{ N = 'Reduzir rastreio de privacidade, publicidade e sugestões'; A = { Disable-Privacidade } },
-        @{ N = 'Desativar serviços desnecessários (mostra lista antes)'; A = {
+        @{ R = 'A'; N = 'Desativar serviços desnecessários (mostra lista antes)'; A = {
             foreach ($n in $Script:ServicosInuteis.Keys) {
                 $s = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
                 if ($s) { Write-Host ("   - {0,-18} {1,-9} {2}" -f $n, $s.StartMode, $Script:ServicosInuteis[$n]) }
@@ -481,10 +540,10 @@ function Menu-Servicos {
             Write-Warn 'Nunca são tocados: Windows Update, Defender, Firewall, Audio, Rede.'
             if (Confirm-Acao 'Desativar os serviços acima?') {
                 foreach ($n in $Script:ServicosInuteis.Keys) { if (Set-Svc $n 'Disabled') { Write-OK "Desativado: $n" } } } } },
-        @{ N = 'Listar serviços em execução (arranque automático)'; A = {
+        @{ L = $true; N = 'Listar serviços em execução (arranque automático)'; A = {
             Get-Service | Where-Object { $_.Status -eq 'Running' } | Sort-Object DisplayName |
                 Select-Object Name, DisplayName | Format-Table -AutoSize | Out-String -Width 120 | Write-Host } },
-        @{ N = 'APLICAR TUDO (telemetria + privacidade + serviços)'; A = {
+        @{ R = 'A'; N = 'APLICAR TUDO (telemetria + privacidade + serviços)'; A = {
             if (Confirm-Acao 'Aplicar todos os ajustes desta secção?') {
                 Disable-Telemetria; Disable-Privacidade
                 foreach ($n in $Script:ServicosInuteis.Keys) { [void](Set-Svc $n 'Disabled') }
@@ -508,12 +567,12 @@ function Menu-Grafica {
         @{ N = 'Ativar suavização de fontes ClearType'; A = { Invoke-Step 'ClearType ativo' {
             Set-Reg 'HKCU:\Control Panel\Desktop' 'FontSmoothing' '2' 'String'
             Set-Reg 'HKCU:\Control Panel\Desktop' 'FontSmoothingType' 2 } } },
-        @{ N = 'Informações da placa gráfica'; A = {
+        @{ L = $true; N = 'Informações da placa gráfica'; A = {
             Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, DriverDate, CurrentRefreshRate,
                 @{ N = 'VRAM (GB)'; E = { [math]::Round($_.AdapterRAM / 1GB, 1) } } | Format-List | Out-String | Write-Host } },
-        @{ N = 'HAGS: ativar (GPU compatível; requer reinício)'; A = { Invoke-Step 'HAGS ativado' { Set-Hags 2 } } },
+        @{ R = 'M'; N = 'HAGS: ativar (GPU compatível; requer reinício)'; A = { Invoke-Step 'HAGS ativado' { Set-Hags 2 } } },
         @{ N = 'Limpar cache de shaders DirectX'; A = { Invoke-Step 'Cache de shaders limpo' { Clear-ShaderCache } } },
-        @{ N = 'Abrir configurações gráficas por aplicação'; A = { Start-Process 'ms-settings:display-advancedgraphics' } }
+        @{ L = $true; N = 'Abrir configurações gráficas por aplicação'; A = { Start-Process 'ms-settings:display-advancedgraphics' } }
     )
 }
 
@@ -531,7 +590,7 @@ function Menu-Interface {
             Invoke-Step 'Pesquisa web desativada' { Set-Reg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1 } } },
         @{ N = 'Desativar atalho das Teclas de Aderência (Shift x5)'; A = {
             Invoke-Step 'Atalho desativado' { Set-Reg 'HKCU:\Control Panel\Accessibility\StickyKeys' 'Flags' '506' 'String' } } },
-        @{ N = '[Win11] Menu de contexto clássico (mostrar mais opções direto)'; A = {
+        @{ R = 'M'; N = '[Win11] Menu de contexto clássico (mostrar mais opções direto)'; A = {
             if (-not $Script:EhWin11) { Write-Warn 'Só aplicável ao Windows 11.'; return }
             Invoke-Step 'Menu clássico ativado' { New-Item -Path "$clsid\InprocServer32" -Force -Value '' | Out-Null; Restart-Explorer } } },
         @{ N = '[Win11] Voltar ao menu de contexto padrão do Windows 11'; A = {
@@ -553,13 +612,13 @@ function Menu-Manutencao {
             Write-Info 'A executar DISM...'; & DISM.exe /Online /Cleanup-Image /RestoreHealth
             Write-Info 'A executar SFC...';  & sfc.exe /scannow } },
         @{ N = 'Verificar o disco do sistema (CHKDSK online, sem reiniciar)'; A = { & chkdsk.exe "$env:SystemDrive" /scan } },
-        @{ N = 'Limpar componentes antigos do Windows (WinSxS)'; A = { & DISM.exe /Online /Cleanup-Image /StartComponentCleanup } },
-        @{ N = 'Criar ponto de restauração agora'; A = { New-Restore } },
-        @{ N = 'Ver espaço livre em disco'; A = {
+        @{ R = 'M'; N = 'Limpar componentes antigos do Windows (WinSxS)'; A = { & DISM.exe /Online /Cleanup-Image /StartComponentCleanup } },
+        @{ L = $true; N = 'Criar ponto de restauração agora'; A = { New-Restore } },
+        @{ L = $true; N = 'Ver espaço livre em disco'; A = {
             Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter, FileSystemLabel,
                 @{ N = 'Total GB'; E = { [math]::Round($_.Size / 1GB, 1) } },
                 @{ N = 'Livre GB'; E = { [math]::Round($_.SizeRemaining / 1GB, 1) } } | Format-Table -AutoSize | Out-String | Write-Host } },
-        @{ N = 'Ver últimas linhas do log deste programa'; A = {
+        @{ L = $true; N = 'Ver últimas linhas do log deste programa'; A = {
             if (Test-Path $Script:LogFile) { Get-Content $Script:LogFile -Tail 25 -Encoding UTF8 | Write-Host } else { Write-Info 'Log vazio.' } } }
     )
 }
@@ -568,7 +627,7 @@ function Menu-Manutencao {
 function Menu-Expansao {
     $tarefa = 'OtimizadorWindows-ManutencaoSemanal'
     Invoke-Menu '12. Expansão de Manutenção (automação e relatórios)' @(
-        @{ N = 'Agendar limpeza semanal automática (domingo 03:00)'; A = {
+        @{ R = 'M'; N = 'Agendar limpeza semanal automática (domingo 03:00)'; A = {
             Invoke-Step 'Tarefa agendada criada' {
                 $s = Join-Path $Script:Pasta 'ManutencaoSemanal.ps1'
                 @'
@@ -588,7 +647,7 @@ Clear-RecycleBin -Force -ErrorAction SilentlyContinue
                 Register-ScheduledTask -TaskName $tarefa -Action $acao -Trigger $trig -Principal $prin -Settings $conf -Force | Out-Null } } },
         @{ N = 'Remover a limpeza semanal agendada'; A = {
             Invoke-Step 'Tarefa removida' { Unregister-ScheduledTask -TaskName $tarefa -Confirm:$false } } },
-        @{ N = 'Ativar Sensor de Armazenamento (limpeza automática do Windows)'; A = {
+        @{ R = 'M'; N = 'Ativar Sensor de Armazenamento (limpeza automática do Windows)'; A = {
             Invoke-Step 'Sensor de Armazenamento ativo' {
                 $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy'
                 Set-Reg $k '01' 1; Set-Reg $k '04' 1; Set-Reg $k '08' 1; Set-Reg $k '256' 30; Set-Reg $k '2048' 7 } } },
@@ -596,16 +655,16 @@ Clear-RecycleBin -Force -ErrorAction SilentlyContinue
             Invoke-Step 'Manutenção Automática iniciada' {
                 Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' 'MaintenanceDisabled' 0
                 & MSchedExe.exe Start } } },
-        @{ N = 'Atualizar programas instalados (winget)'; A = {
+        @{ R = 'M'; N = 'Atualizar programas instalados (winget)'; A = {
             if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { Write-Warn 'winget não encontrado (instale o "App Installer").'; return }
             if (Confirm-Acao 'Atualizar todos os programas?') {
                 & winget.exe upgrade --all --include-unknown --accept-source-agreements --accept-package-agreements } } },
-        @{ N = 'Abrir Windows Update'; A = { Start-Process 'ms-settings:windowsupdate' } },
-        @{ N = 'Relatório de eficiência energética (60 s)'; A = {
+        @{ L = $true; N = 'Abrir Windows Update'; A = { Start-Process 'ms-settings:windowsupdate' } },
+        @{ L = $true; N = 'Relatório de eficiência energética (60 s)'; A = {
             $f = Join-Path ([Environment]::GetFolderPath('Desktop')) 'relatorio-energia.html'
             Write-Info 'A recolher dados durante 60 segundos...'
             & powercfg.exe /energy /duration 60 /output $f | Out-Null; Write-OK "Relatório: $f" } },
-        @{ N = 'Gerar relatório do sistema (Ambiente de trabalho)'; A = {
+        @{ L = $true; N = 'Gerar relatório do sistema (Ambiente de trabalho)'; A = {
             $f = Join-Path ([Environment]::GetFolderPath('Desktop')) "relatorio-sistema-$(Get-Date -Format 'yyyyMMdd-HHmm').txt"
             $os = Get-CimInstance Win32_OperatingSystem; $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
             @(
@@ -632,6 +691,7 @@ function Show-Principal {
     $t = $os.TotalVisibleMemorySize / 1MB; $l = $os.FreePhysicalMemory / 1MB
     Write-Host ("  PC: {0}  |  {1}" -f $env:COMPUTERNAME, $os.Caption) -ForegroundColor Gray
     Write-Host ("  RAM: {0:N1}/{1:N1} GB livres  |  Privilégios: Administrador ✔" -f $l, $t) -ForegroundColor Gray
+    Write-Host ("  Tipo: {0}  |  Disco do sistema: {1}" -f $(if ($Script:EhPortatil) { 'Portátil' } else { 'Desktop' }), $Script:MidiaSistema) -ForegroundColor Gray
     Write-Host ("  " + ('─' * ($Script:Largura - 2))) -ForegroundColor DarkGray
     $m = @('Otimização de Inicialização e Desligamento', 'Otimização de Acesso (disco e arquivos)', 'Controle Energético',
            'Otimização de Memória e Processamento', 'Aceleração de Drives e Periféricos', 'Otimização de Rede e Internet',
@@ -641,7 +701,18 @@ function Show-Principal {
     Write-Host ""
     Write-Host "   [ R] Reverter alterações feitas por este programa" -ForegroundColor Yellow
     Write-Host "   [ P] Criar ponto de restauração" -ForegroundColor Yellow
+    Write-Host ("   [ S] Modo simulação (mostra o que seria feito, sem alterar): {0}" -f $(if ($Script:Simulacao) { 'LIGADO' } else { 'desligado' })) -ForegroundColor Magenta
     Write-Host "   [ 0] Sair" -ForegroundColor DarkGray
+}
+
+$usuarioConsola = (Get-CimInstance Win32_ComputerSystem).UserName
+$usuarioAtual   = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+if ($usuarioConsola -and ($usuarioConsola -ne $usuarioAtual)) {
+    Show-Header 'Atenção: perfil de utilizador diferente'
+    Write-Warn "Sessão ativa: $usuarioConsola  |  Este programa corre como: $usuarioAtual"
+    Write-Warn 'Ajustes de utilizador (HKCU) seriam aplicados ao perfil do administrador, não ao da sessão ativa.'
+    Write-Info 'Solução: inicie sessão com a conta que quer otimizar (com direitos de administrador) e execute de novo.'
+    if (-not (Confirm-Acao 'Continuar mesmo assim?')) { exit }
 }
 
 Show-Header 'Bem-vindo'
@@ -658,6 +729,7 @@ while (-not $sair) {
         '10' { Menu-Interface }     '11' { Menu-Manutencao } '12' { Menu-Expansao }
         'R'  { Show-Header 'Reverter alterações'; Restore-All; Pausar }
         'P'  { Show-Header 'Ponto de restauração'; New-Restore; Pausar }
+        'S'  { $Script:Simulacao = -not $Script:Simulacao }
         '0'  { $sair = $true }
     }
 }
